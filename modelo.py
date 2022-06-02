@@ -5,16 +5,13 @@
 ### Part of Code borrow from "CGDL"
 
 
-from distutils.errors import UnknownFileError
 import numpy as np
 import torch
 import utils as ut
 from torch.autograd import Variable
 from torch import autograd, nn, optim
 from torch.nn import functional as F
-from utils import *
-import torchvision.transforms as T
-
+import time
 
 reconstruction_function = nn.MSELoss()
 reconstruction_function.size_average = False
@@ -112,6 +109,97 @@ class FCONV(nn.Module):
         x_re = self.final(x)
         return x_re
 
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
+    It also supports the unsupervised contrastive loss in SimCLR"""
+    def __init__(self, temperature=0.07, contrast_mode='all',
+                 base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        """Compute loss for model. If both `labels` and `mask` are None,
+        it degenerates to SimCLR unsupervised loss:
+        https://arxiv.org/pdf/2002.05709.pdf
+        Args:
+            features: hidden vector of shape [bsz, n_views, ...]. n_views is number of augmentations
+            labels: ground truth of shape [bsz].
+            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
+                has the same class as sample i. Can be asymmetric.
+        Returns:
+            A loss scalar.
+        """
+        device = (torch.device('cuda')
+                  if features.is_cuda
+                  else torch.device('cpu'))
+
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...],'
+                             'at least 3 dimensions are required')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
+
 class LVAE(nn.Module):
     def __init__(self, in_ch=3,
                  out_ch64=64, out_ch128=128, out_ch256=256, out_ch512=512,
@@ -152,7 +240,6 @@ class LVAE(nn.Module):
             self.CONV1_1 = CONV(self.in_ch, self.out_ch64, self.kernel1, self.padding2, self.stride1, self.flat_dim32,
                                 self.latent_dim512)
         else:
-            
             self.CONV1_1 = CONV(self.in_ch, self.out_ch64, self.kernel1, self.padding0, self.stride1, self.flat_dim32,
                                 self.latent_dim512)
         self.CONV1_2 = CONV(self.out_ch64, self.out_ch64, self.kernel3, self.padding1, self.stride2, self.flat_dim16,
@@ -213,7 +300,7 @@ class LVAE(nn.Module):
         self.one_hot = nn.Linear(self.num_class, 32)
 
 
-    def lnet(self, x, args):
+    def lnet(self, x, y_de, args):
         """
         This function .. 
 
@@ -244,17 +331,29 @@ class LVAE(nn.Module):
         enc5_2, mu_latent, var_latent = self.CONV5_2.encode(enc5_1)
 
         # split z and y
-        z_latent_mu, y_latent_mu = mu_latent.split([args.len_Z, args.len_W], dim=1)
-        z_latent_var, y_latent_var = var_latent.split([args.len_Z, args.len_W], dim=1)
-        
-        latent = ut.sample_gaussian(mu_latent, var_latent)
-        # W: they sample from the distribution to get a latent feature vector Y 
-        latent_y = ut.sample_gaussian(y_latent_mu, y_latent_var)
+        if args.len_Z:
+            z_latent_mu, y_latent_mu = mu_latent.split([args.len_Z, 32], dim=1)
+            z_latent_var, y_latent_var = var_latent.split([args.len_Z, 32], dim=1)
+            
+            # print('latent_vars ', mu_latent, var_latent)
+
+            latent = ut.sample_gaussian(mu_latent, var_latent)
+            # print('latent', latent)
+
+            # W: they sample from the distribution to get a latent feature vector Y 
+            latent_y = ut.sample_gaussian(y_latent_mu, y_latent_var)
+            # print('latent_y', latent_y)
+
+        else:
+            y_latent_mu = mu_latent
+            y_latent_var = var_latent
+            latent = ut.sample_gaussian(mu_latent, var_latent)
+            latent_y = latent
 
         # W: classify the image using the latent feature vector Y 
         predict = F.log_softmax(self.classifier(latent_y), dim=1)
         predict_test = F.log_softmax(self.classifier(y_latent_mu), dim=1)
-        # yh = self.one_hot(y_de)
+        yh = self.one_hot(y_de)
 
         # partially downwards
         dec5_1, mu_dn5_1, var_dn5_1 = self.TCONV5_2.decode(latent)
@@ -322,14 +421,13 @@ class LVAE(nn.Module):
 
         x_re = self.TCONV1_1.final_decode(de_latent1_1)
 
-        # if self.training: 
-        #     self.contra_loss = self.contrastive_loss(x, y_de, x_re, args)
+        if self.training and args.contra_loss:
+            self.contra_loss = self.contrastive_loss(x, y_de, x_re, args)
 
-        # removed yh output from return statement 
         return latent, mu_latent, var_latent, \
                qmu5_1, qvar5_1, qmu4_2, qvar4_2, qmu4_1, qvar4_1, qmu3_2, qvar3_2, qmu3_1, qvar3_1, \
                qmu2_2, qvar2_2, qmu2_1, qvar2_1, qmu1_2, qvar1_2, qmu1_1, qvar1_1, \
-               predict, predict_test,  \
+               predict, predict_test, yh, \
                x_re, \
                mu_dn5_1, var_dn5_1, mu_dn4_2, var_dn4_2, mu_dn4_1, var_dn4_1, mu_dn3_2, var_dn3_2, mu_dn3_1, var_dn3_1, \
                mu_dn2_2, var_dn2_2, mu_dn2_1, var_dn2_1, mu_dn1_2, var_dn1_2, mu_dn1_1, var_dn1_1
@@ -347,67 +445,82 @@ class LVAE(nn.Module):
         latent, mu_latent, var_latent, \
         qmu5_1, qvar5_1, qmu4_2, qvar4_2, qmu4_1, qvar4_1, qmu3_2, qvar3_2, qmu3_1, qvar3_1, \
         qmu2_2, qvar2_2, qmu2_1, qvar2_1, qmu1_2, qvar1_2, qmu1_1, qvar1_1, \
-        predict, predict_test,\
+        predict, predict_test, yh, \
         x_re, \
         pmu5_1, pvar5_1,pmu4_2, pvar4_2, pmu4_1, pvar4_1, pmu3_2, pvar3_2, pmu3_1, pvar3_1, \
-        pmu2_2, pvar2_2, pmu2_1, pvar2_1, pmu1_2, pvar1_2, pmu1_1, pvar1_1 = self.lnet(x, args)
+        pmu2_2, pvar2_2, pmu2_1, pvar2_1, pmu1_2, pvar1_2, pmu1_1, pvar1_1 = self.lnet(x, y_de, args)
 
         rec = reconstruction_function(x_re, x) # MSE loss of reconstructed x and x 
 
-        # split z and y 
-        z_latent_mu, y_latent_mu = mu_latent.split([args.len_Z, args.len_W], dim=1)
-        z_latent_var, y_latent_var = var_latent.split([args.len_Z, args.len_W], dim=1)
+        # split z and y if len_Z
+        if args.len_Z:
+            z_latent_mu, y_latent_mu = mu_latent.split([args.len_Z, 32], dim=1)
+            z_latent_var, y_latent_var = var_latent.split([args.len_Z, 32], dim=1)
+            pm_z, pv_z = torch.zeros(z_latent_mu.shape).to(args.device), torch.ones(z_latent_var.shape).to(args.device)
+        else:
+            y_latent_mu = mu_latent
+            y_latent_var = var_latent
 
+        pm, pv = torch.zeros(y_latent_mu.shape).to(args.device), torch.ones(y_latent_var.shape).to(args.device)
 
-        pm_z, pv_z = torch.zeros(z_latent_mu.shape).to(args.device), torch.ones(z_latent_var.shape).to(args.device)
-
-        # define prior variance: 
-        pv = torch.ones(y_latent_var.shape).to(args.device)
-        # define class specific prior mean (is learned through MLP layer)
-        pm = self.one_hot(y_de)
-
-        kl_latent = ut.kl_normal(y_latent_mu, y_latent_var, pm, pv)
-        kl5_1 = ut.kl_normal(qmu5_1, qvar5_1, pmu5_1, pvar5_1)
-        kl4_2 = ut.kl_normal(qmu4_2, qvar4_2, pmu4_2, pvar4_2)
-        kl4_1 = ut.kl_normal(qmu4_1, qvar4_1, pmu4_1, pvar4_1)
-        kl3_2 = ut.kl_normal(qmu3_2, qvar3_2, pmu3_2, pvar3_2)
-        kl3_1 = ut.kl_normal(qmu3_1, qvar3_1, pmu3_1, pvar3_1)
-        kl2_2 = ut.kl_normal(qmu2_2, qvar2_2, pmu2_2, pvar2_2)
-        kl2_1 = ut.kl_normal(qmu2_1, qvar2_1, pmu2_1, pvar2_1)
-        kl1_2 = ut.kl_normal(qmu1_2, qvar1_2, pmu1_2, pvar1_2)
-        kl1_1 = ut.kl_normal(qmu1_1, qvar1_1, pmu1_1, pvar1_1)
+        kl_latent = ut.kl_normal(y_latent_mu, y_latent_var, pm, pv, yh)
+        kl5_1 = ut.kl_normal(qmu5_1, qvar5_1, pmu5_1, pvar5_1, 0)
+        kl4_2 = ut.kl_normal(qmu4_2, qvar4_2, pmu4_2, pvar4_2, 0)
+        kl4_1 = ut.kl_normal(qmu4_1, qvar4_1, pmu4_1, pvar4_1, 0)
+        kl3_2 = ut.kl_normal(qmu3_2, qvar3_2, pmu3_2, pvar3_2, 0)
+        kl3_1 = ut.kl_normal(qmu3_1, qvar3_1, pmu3_1, pvar3_1, 0)
+        kl2_2 = ut.kl_normal(qmu2_2, qvar2_2, pmu2_2, pvar2_2, 0)
+        kl2_1 = ut.kl_normal(qmu2_1, qvar2_1, pmu2_1, pvar2_1, 0)
+        kl1_2 = ut.kl_normal(qmu1_2, qvar1_2, pmu1_2, pvar1_2, 0)
+        kl1_1 = ut.kl_normal(qmu1_1, qvar1_1, pmu1_1, pvar1_1, 0)
 
         kl_all = kl_latent + kl5_1 + kl4_2 + kl4_1 + kl3_2 + kl3_1 + kl2_2 + kl2_1 + kl1_2 + kl1_1
 
-        kl_all += args.beta_z * ut.kl_normal(z_latent_mu, z_latent_var, pm_z, pv_z)
+        if args.len_Z:
+            kl_all += args.beta_z * ut.kl_normal(z_latent_mu, z_latent_var, pm_z, pv_z, 0)
 
         kl = beta * torch.mean(kl_all)
 
         ce = nllloss(predict, y)
 
-        nelbo = rec + kl + lamda*ce
 
-        self.contra_loss =  self.contrastive_loss(x, y_de, x_re, args)
-        nelbo += args.nu * self.contra_loss
+        nelbo = rec + kl + lamda*ce
+        # if args.mmd_logits_loss: 
+        #     mmd_loss = 
+        #     nelbo += 
+
+        if args.supcon_loss: 
+            W_aug, _, _ = self.test(x, y_de, args)
+            WW_aug = torch.cat((y_latent_mu.unsqueeze(dim=1), W_aug.unsqueeze(dim=1)), dim=1)
+            self.supcon_loss = self.supcon_critic(WW_aug, y)
+            nelbo += args.theta * self.supcon_loss 
+
+        if args.contra_loss: 
+            contra_loss = self.contra_loss
+            nelbo += args.nu * contra_loss
 
         if args.mmd_loss: 
             W = y_latent_mu
-            self.invar_loss = self.mmd_loss(W, x, y_de, args)
+            self.invar_loss = self.mmd_loss(W, x, y, y_de, args)
             nelbo += args.eta * self.invar_loss
+
 
         return nelbo, y_latent_mu, predict, predict_test, x_re,rec,kl,lamda*ce
 
 
-    def test(self, x, args):
+    def test(self, x, y_de, args):
         _, mu_latent, _, \
         _, _, _, _, _, _, _, _, _, _,\
         _, _, _, _, _, _, _, _, \
-        _, predict_test, \
+        _, predict_test, _ ,\
         x_re, \
         pmu5_1, pvar5_1, pmu4_2, pvar4_2, pmu4_1, pvar4_1, pmu3_2, pvar3_2, pmu3_1, pvar3_1, \
-        pmu2_2, pvar2_2, pmu2_1, pvar2_1, pmu1_2, pvar1_2, pmu1_1, pvar1_1 = self.lnet(x, args)
+        pmu2_2, pvar2_2, pmu2_1, pvar2_1, pmu1_2, pvar1_2, pmu1_1, pvar1_1 = self.lnet(x, y_de, args)
 
-        z_latent_mu, y_latent_mu = mu_latent.split([args.len_Z, args.len_W], dim=1)
+        if args.len_Z:
+            z_latent_mu, y_latent_mu = mu_latent.split([args.len_Z, 32], dim=1)
+        else:
+            y_latent_mu = mu_latent
 
         return y_latent_mu, predict_test, x_re
 
@@ -418,22 +531,22 @@ class LVAE(nn.Module):
     def contrastive_loss(self, x, target, rec_x, args):
         """
         input 
-            x: batch of input images, batchsize x channel x height x width 
-            target: one-hot targets of x, batchsize x num_classes 
+            x: batch of input images, batchsize x 1 x 28 x 28 (for MNIST)
+            target: one-hot targets of x, batchsize x n_seen 
         """
         bs = x.size(0)
         ### get the embedded version of y_latent from the target onehot vector
-        target_en = torch.eye(self.num_class) # 6x6 
+        target_en = torch.eye(args.n_seen) # 6x6 
         class_yh = self.get_yh(target_en.to(args.device)) # 6x32
         yh_size = class_yh.size(1)
 
-        neg_class_num = self.num_class - 1
+        neg_class_num = args.n_seen - 1
         # z_neg = z.unsqueeze(1).repeat(1, neg_class_num, 1)
         y_neg = torch.zeros((bs, neg_class_num, yh_size)).to(args.device)
         for i in range(bs):
             # Get de indices of the y labels that are not the target - so all counterfacts 
             # and create an embedded tensor from the one-hot counterfacts  
-            y_sample = [idx for idx in range(self.num_class) if idx != torch.argmax(target[i])]
+            y_sample = [idx for idx in range(args.n_seen) if idx != torch.argmax(target[i])]
             y_neg[i] = class_yh[y_sample]
         # zy_neg = torch.cat([z_neg, y_neg], dim=2).view(bs*neg_class_num, z.size(1)+yh_size)
 
@@ -441,7 +554,7 @@ class LVAE(nn.Module):
         rec_x_neg = self.generate_cf(x, target, y_neg, args)
         rec_x_all = torch.cat([rec_x.unsqueeze(1), rec_x_neg], dim=1)
 
-        x_expand = x.unsqueeze(1).repeat(1, self.num_class, 1, 1, 1)
+        x_expand = x.unsqueeze(1).repeat(1, args.n_seen, 1, 1, 1)
         # take the difference in the generation of all counterfacts y' (and fact y) and
         # the original image x
         neg_dist = -((x_expand - rec_x_all) ** 2).mean((2,3,4)) * args.temperature  # N*(K+1)
@@ -449,21 +562,53 @@ class LVAE(nn.Module):
         contrastive_loss_euclidean = nn.CrossEntropyLoss()(neg_dist, label)
         return contrastive_loss_euclidean
 
-    def mmd_loss(self, W, x, labels_onehot, args): 
+    def mmd_logits_loss(self, predict, x, labels, labels_onehot, args): 
+        _, predict_aug, _ = self.test(args.transforms(x), labels_onehot, args)
+        mmd_losses = torch.zeros(args.n_seen)
+        for i in range(args.n_seen): 
+            n = len(labels[labels==i])
+            if n == 0: 
+                continue
+            mmd_losses[i] = ut.MMD(predict[labels==i], predict_aug[labels==i], kernel=args.kernel, device=args.device)
+
+    def mmd_loss(self, W, x, labels, labels_onehot, args): 
         "MMD loss between input and augmented input"    
+        # transforms = T.Compose([T.ColorJitter(0.4, 0.4, 0.4, 0.1), T.RandomGrayscale(p=0.3)])
+        W_aug, _, _ = self.test(args.transforms(x), labels_onehot, args)
+        mmd_losses = torch.zeros(args.n_seen)
 
-        transforms = T.Compose([T.ColorJitter(0.4, 0.4, 0.4, 0.1), T.RandomGrayscale(p=0.3)])
-        W_aug = self.test(transforms(x), labels_onehot, args)
+        for i in range(args.n_seen): 
+            if len(W[labels==i]) == 0: 
+                continue
+            mmd_losses[i] = ut.MMD(W[labels==i], W_aug[labels==i], kernel=args.kernel, device=args.device)
+        
+        return torch.mean(mmd_losses) * args.batch_size
 
-        loss = MMD_loss(W, W_aug, args.gamma)        
+    def relic_loss(self, W, x, labels, labels_onehot, args): 
+        "RELIC loss based on the FAIR paper"
+
+
+
+        return None
+
+    # def supcon_loss(self, W, x, labels, labels_onehot, args): 
+    #     "Calculates the supervised contrastive loss"
+    #     W_aug, _, _ = self.test(args.transforms(x), labels_onehot, args)
+    #     loss = 0 
+
+    #     for i in range(args.n_seen): 
+    #         P = len(W[W==i])
+    #         sim = ...        
+
         
-        return loss 
-        
-    def rec_loss_cf(self, feature_y_mean, val_loader, test_loader, args):
+    #     return None
+
+
+    def rec_loss_cf(self, feature_y_mean, test_loader_seen, test_loader_unseen, args):
         rec_loss_cf_all = []
         class_num = feature_y_mean.size(0)
-        for data_test, target_test in val_loader:
-            target_test_en = torch.Tensor(target_test.shape[0], self.num_class)
+        for data_test, target_test in test_loader_seen:
+            target_test_en = torch.Tensor(target_test.shape[0], args.n_seen)
             target_test_en.zero_()
             target_test_en.scatter_(1, target_test.view(-1, 1), 1)  # one-hot encoding
             target_test_en = target_test_en.to(args.device)
@@ -479,8 +624,8 @@ class LVAE(nn.Module):
             rec_loss_cf_all.append(rec_loss_cf)
 
 
-        for data_test, target_test in test_loader:
-            target_test_en = torch.Tensor(target_test.shape[0], self.num_class)
+        for data_test, target_test in test_loader_unseen:
+            target_test_en = torch.Tensor(target_test.shape[0], args.n_seen)
             target_test_en.zero_()
             # target_test_en.scatter_(1, target_test.view(-1, 1), 1)  # one-hot encoding
             target_test_en = target_test_en.to(args.device)
@@ -503,7 +648,7 @@ class LVAE(nn.Module):
         rec_loss_cf_all = []
         class_num = feature_y_mean.size(0)
         for data_train, target_train in train_loader:
-            target_train_en = torch.Tensor(target_train.shape[0], self.num_class)
+            target_train_en = torch.Tensor(target_train.shape[0], args.n_seen)
             target_train_en.zero_()
             target_train_en.scatter_(1, target_train.view(-1, 1), 1)  # one-hot encoding
             target_train_en = target_train_en.to(args.device)
@@ -517,7 +662,7 @@ class LVAE(nn.Module):
             rec_loss = (re_train - data_train_cf).pow(2).sum((2, 3, 4))
             rec_loss_cf = rec_loss.min(1)[0]
             rec_loss_cf_all.append(rec_loss_cf)
-
+    
         rec_loss_cf_all = torch.cat(rec_loss_cf_all, 0)
         return rec_loss_cf_all
 
@@ -549,8 +694,8 @@ class LVAE(nn.Module):
         enc5_2, mu_latent, var_latent = self.CONV5_2.encode(enc5_1)
 
 
-        z_latent_mu, y_latent_mu = mu_latent.split([args.len_Z, args.len_W], dim=1)
-        z_latent_var, y_latent_var = var_latent.split([args.len_Z, args.len_W], dim=1)
+        z_latent_mu, y_latent_mu = mu_latent.split([args.len_Z, 32], dim=1)
+        z_latent_var, y_latent_var = var_latent.split([args.len_Z, 32], dim=1)
 
         z_latent_mu = z_latent_mu.unsqueeze(1).repeat(1, class_num, 1)
         if mean_y.dim() == 2:
